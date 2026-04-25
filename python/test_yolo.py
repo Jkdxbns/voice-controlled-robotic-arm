@@ -1,527 +1,282 @@
-#include <Wire.h>
-#include <Adafruit_VL53L0X.h>
-#include <Servo.h>
-
-#define MUX_ADDR 0x70
-
-#define SERVO_CAM 10
-#define SERVO_BASE 7
-#define SERVO_SHO 6
-#define SERVO_ELB 5
-#define SERVO_GRIP 3
-
-#define TOF_GRIP_CH 2
-#define TOF_CAM_CH 3
-
-#define CAM_MIN 35
-#define CAM_MAX 120
-#define CAM_HOME 40
-
-#define BASE_MIN 0
-#define BASE_MAX 90
-#define BASE_HOME 45
-
-#define SHO_HOME 90
-#define ELB_HOME 10
-#define GRIP_HOME 0
-
-#define GRIP_OPEN_ANGLE 75
-#define GRIP_CLOSE_ANGLE 10
-
-#define SERVO_SMOOTH_STEP_DEG 2
-#define SERVO_SMOOTH_DELAY_MS 8
-#define SHOULDER_RATE_NUM 3
-#define SHOULDER_RATE_DEN 5
-
-const float L1_MM = 75.0f;
-const float L2_MM = 155.0f;
-
-const float CAM_L_BIAS_MM = 28.0f;
-const float CAM_X_BIAS_MM = -74.0f;
-const float CAM_Y_BIAS_MM = 40.0f;
-
-const float STANDOFF_Y_MM = 90.0f;
-const float GRASP_X_OFFSET_MM = 20.0f;
-const float GRASP_Y_OFFSET_MM = -15.0f;
-const float HOME_X_MM = 230.0f;
-const float HOME_Y_MM = 0.0f;
-
-const int STAGE_SETTLE_MS = 220;
-const int GRIP_SETTLE_MS = 180;
-
-const bool ENABLE_GRIP_TOF_INIT = false;
-
-Adafruit_VL53L0X tof_grip;
-Adafruit_VL53L0X tof_cam;
-
-Servo servo_cam;
-Servo servo_base;
-Servo servo_sho;
-Servo servo_elb;
-Servo servo_grip;
-
-int cam_angle = CAM_HOME;
-int base_angle = BASE_HOME;
-int sho_angle = SHO_HOME;
-int elb_angle = ELB_HOME;
-int grip_angle = GRIP_HOME;
-
-char linebuf[48];
-uint8_t linepos = 0;
-
-void selectBus(uint8_t bus)
-{
-  if (bus > 7)
-    return;
-  Wire.beginTransmission(MUX_ADDR);
-  Wire.write(1 << bus);
-  Wire.endTransmission();
-}
-
-int readCamDistance()
-{
-  selectBus(TOF_CAM_CH);
-  VL53L0X_RangingMeasurementData_t m;
-  tof_cam.rangingTest(&m, false);
-  if (m.RangeStatus == 4)
-    return -1;
-  return m.RangeMilliMeter;
-}
-
-static bool inRangeF(float v, float lo, float hi)
-{
-  return (v >= lo && v <= hi);
-}
-
-void setBaseAngle(int a)
-{
-  if (a < BASE_MIN)
-    a = BASE_MIN;
-  if (a > BASE_MAX)
-    a = BASE_MAX;
-
-  int dir = (a >= base_angle) ? 1 : -1;
-  int step = SERVO_SMOOTH_STEP_DEG * dir;
-  while (base_angle != a)
-  {
-    int next = base_angle + step;
-    if ((dir > 0 && next > a) || (dir < 0 && next < a))
-      next = a;
-    base_angle = next;
-    servo_base.write(base_angle);
-    delay(SERVO_SMOOTH_DELAY_MS);
-  }
-}
-
-void setCamAngle(int a)
-{
-  if (a < CAM_MIN)
-    a = CAM_MIN;
-  if (a > CAM_MAX)
-    a = CAM_MAX;
-
-  int dir = (a >= cam_angle) ? 1 : -1;
-  int step = SERVO_SMOOTH_STEP_DEG * dir;
-  while (cam_angle != a)
-  {
-    int next = cam_angle + step;
-    if ((dir > 0 && next > a) || (dir < 0 && next < a))
-      next = a;
-    cam_angle = next;
-    servo_cam.write(cam_angle);
-    delay(SERVO_SMOOTH_DELAY_MS);
-  }
-}
-
-void setGripperAngle(int a)
-{
-  if (a < 0)
-    a = 0;
-  if (a > 180)
-    a = 180;
-
-  int dir = (a >= grip_angle) ? 1 : -1;
-  int step = SERVO_SMOOTH_STEP_DEG * dir;
-  while (grip_angle != a)
-  {
-    int next = grip_angle + step;
-    if ((dir > 0 && next > a) || (dir < 0 && next < a))
-      next = a;
-    grip_angle = next;
-    servo_grip.write(grip_angle);
-    delay(SERVO_SMOOTH_DELAY_MS);
-  }
-}
-
-static bool solveIKBranch(float x_mm, float y_mm, bool elbowUp,
-                          float &shoCmdDeg, float &elbCmdDeg)
-{
-  float c2 = (x_mm * x_mm + y_mm * y_mm - L1_MM * L1_MM - L2_MM * L2_MM) /
-             (2.0f * L1_MM * L2_MM);
-  if (c2 < -1.0f || c2 > 1.0f)
-    return false;
-
-  float s2 = sqrtf(1.0f - c2 * c2);
-  if (!elbowUp)
-    s2 = -s2;
-
-  float q2Deg = atan2f(s2, c2) * 180.0f / PI;
-  float q1Deg = (atan2f(y_mm, x_mm) - atan2f(L2_MM * s2, L1_MM + L2_MM * c2)) * 180.0f / PI;
-
-  shoCmdDeg = SHO_HOME + q1Deg;
-  elbCmdDeg = ELB_HOME + q2Deg;
-  return true;
-}
-
-void smoothMoveArmSE(int targetSho, int targetElb)
-{
-  if (targetSho < 0)
-    targetSho = 0;
-  else if (targetSho > 180)
-    targetSho = 180;
-  if (targetElb < 0)
-    targetElb = 0;
-  else if (targetElb > 180)
-    targetElb = 180;
-
-  int shoulder_phase = 0;
-
-  while (sho_angle != targetSho || elb_angle != targetElb)
-  {
-    shoulder_phase += SHOULDER_RATE_NUM;
-    if (shoulder_phase >= SHOULDER_RATE_DEN)
-    {
-      shoulder_phase -= SHOULDER_RATE_DEN;
-      if (sho_angle < targetSho)
-      {
-        int next = sho_angle + SERVO_SMOOTH_STEP_DEG;
-        if (next > targetSho)
-          next = targetSho;
-        sho_angle = next;
-      }
-      else if (sho_angle > targetSho)
-      {
-        int next = sho_angle - SERVO_SMOOTH_STEP_DEG;
-        if (next < targetSho)
-          next = targetSho;
-        sho_angle = next;
-      }
-    }
-
-    if (elb_angle < targetElb)
-    {
-      int next = elb_angle + SERVO_SMOOTH_STEP_DEG;
-      if (next > targetElb)
-        next = targetElb;
-      elb_angle = next;
-    }
-    else if (elb_angle > targetElb)
-    {
-      int next = elb_angle - SERVO_SMOOTH_STEP_DEG;
-      if (next < targetElb)
-        next = targetElb;
-      elb_angle = next;
-    }
-
-    servo_sho.write(sho_angle);
-    servo_elb.write(elb_angle);
-    delay(SERVO_SMOOTH_DELAY_MS);
-  }
-}
-
-bool moveToXYMM(float x_mm, float y_mm)
-{
-  float shoA, elbA, shoB, elbB;
-  bool realA = solveIKBranch(x_mm, y_mm, true, shoA, elbA);
-  bool realB = solveIKBranch(x_mm, y_mm, false, shoB, elbB);
-
-  bool validA = realA && inRangeF(shoA, 0.0f, 180.0f) && inRangeF(elbA, 0.0f, 180.0f);
-  bool validB = realB && inRangeF(shoB, 0.0f, 180.0f) && inRangeF(elbB, 0.0f, 180.0f);
-
-  bool useA = false;
-  bool useB = false;
-
-  if (validA && validB)
-  {
-    float distA = fabsf(shoA - sho_angle) + fabsf(elbA - elb_angle);
-    float distB = fabsf(shoB - sho_angle) + fabsf(elbB - elb_angle);
-    if (distA <= distB)
-      useA = true;
-    else
-      useB = true;
-  }
-  else if (validA)
-  {
-    useA = true;
-  }
-  else if (validB)
-  {
-    useB = true;
-  }
-
-  if (useA)
-  {
-    smoothMoveArmSE((int)roundf(shoA), (int)roundf(elbA));
-    return true;
-  }
-  if (useB)
-  {
-    smoothMoveArmSE((int)roundf(shoB), (int)roundf(elbB));
-    return true;
-  }
-
-  return false;
-}
-
-void goSafeHome()
-{
-  setBaseAngle(BASE_HOME);
-  setCamAngle(CAM_HOME);
-  smoothMoveArmSE(SHO_HOME, ELB_HOME);
-  setGripperAngle(GRIP_HOME);
-}
-
-bool computeTargetFromCam(int L_mm, int theta_deg, float &x_out, float &y_out)
-{
-  if (L_mm <= 0)
-    return false;
-  float thetaRad = theta_deg * PI / 180.0f;
-  float Lb = ((float)L_mm) + CAM_L_BIAS_MM;
-  x_out = Lb * cosf(thetaRad) + CAM_X_BIAS_MM;
-  y_out = Lb * sinf(thetaRad) + CAM_Y_BIAS_MM;
-  return true;
-}
-
-bool doPickAndPlace()
-{
-  int L = readCamDistance();
-  if (L < 0)
-    return false;
-
-  float x_obj = 0.0f, y_obj = 0.0f;
-  if (!computeTargetFromCam(L, cam_angle, x_obj, y_obj))
-    return false;
-
-  float y_obj_pre = y_obj - STANDOFF_Y_MM;
-
-  setGripperAngle(GRIP_OPEN_ANGLE);
-  delay(GRIP_SETTLE_MS);
-
-  if (!moveToXYMM(x_obj, y_obj_pre))
-  {
-    goSafeHome();
-    return false;
-  }
-  delay(STAGE_SETTLE_MS);
-
-  if (!moveToXYMM(x_obj + GRASP_X_OFFSET_MM, y_obj + GRASP_Y_OFFSET_MM))
-  {
-    goSafeHome();
-    return false;
-  }
-  delay(STAGE_SETTLE_MS);
-
-  setGripperAngle(GRIP_CLOSE_ANGLE);
-  delay(GRIP_SETTLE_MS);
-
-  if (!moveToXYMM(x_obj, y_obj_pre))
-  {
-    goSafeHome();
-    return false;
-  }
-  delay(STAGE_SETTLE_MS);
-
-  if (!moveToXYMM(HOME_X_MM, HOME_Y_MM))
-  {
-    goSafeHome();
-    return false;
-  }
-  delay(STAGE_SETTLE_MS);
-
-  return true;
-}
-
-bool doPrePick()
-{
-  int L = readCamDistance();
-  if (L < 0)
-    return false;
-
-  float x_obj = 0.0f, y_obj = 0.0f;
-  if (!computeTargetFromCam(L, cam_angle, x_obj, y_obj))
-    return false;
-
-  float y_obj_pre = y_obj - STANDOFF_Y_MM;
-
-  setGripperAngle(GRIP_OPEN_ANGLE);
-  delay(GRIP_SETTLE_MS);
-
-  if (!moveToXYMM(x_obj, y_obj_pre))
-  {
-    goSafeHome();
-    return false;
-  }
-  delay(STAGE_SETTLE_MS);
-
-  return true;
-}
-
-bool doGrabFromCurrentCam()
-{
-  int L = readCamDistance();
-  if (L < 0)
-    return false;
-
-  float x_obj = 0.0f, y_obj = 0.0f;
-  if (!computeTargetFromCam(L, cam_angle, x_obj, y_obj))
-    return false;
-
-  float y_obj_pre = y_obj - STANDOFF_Y_MM;
-
-  if (!moveToXYMM(x_obj + GRASP_X_OFFSET_MM, y_obj + GRASP_Y_OFFSET_MM))
-  {
-    goSafeHome();
-    return false;
-  }
-  delay(STAGE_SETTLE_MS);
-
-  setGripperAngle(GRIP_CLOSE_ANGLE);
-  delay(GRIP_SETTLE_MS);
-
-  if (!moveToXYMM(x_obj, y_obj_pre))
-  {
-    goSafeHome();
-    return false;
-  }
-  delay(STAGE_SETTLE_MS);
-
-  if (!moveToXYMM(HOME_X_MM, HOME_Y_MM))
-  {
-    goSafeHome();
-    return false;
-  }
-  delay(STAGE_SETTLE_MS);
-
-  return true;
-}
-
-void handleLine(char *s)
-{
-  if (s[0] == 0)
-    return;
-
-  if (!strcasecmp(s, "pick") || !strcasecmp(s, "pp"))
-  {
-    if (doPickAndPlace())
-      Serial.println(F("OK"));
-    else
-      Serial.println(F("ERR"));
-    return;
-  }
-
-  if (!strcasecmp(s, "prepick"))
-  {
-    if (doPrePick())
-      Serial.println(F("OK"));
-    else
-      Serial.println(F("ERR"));
-    return;
-  }
-
-  if (!strcasecmp(s, "grab"))
-  {
-    if (doGrabFromCurrentCam())
-      Serial.println(F("OK"));
-    else
-      Serial.println(F("ERR"));
-    return;
-  }
-
-  if (!strcasecmp(s, "home"))
-  {
-    goSafeHome();
-    return;
-  }
-
-  if ((s[0] == 'b' || s[0] == 'B') && s[1] == ' ')
-  {
-    setBaseAngle(atoi(s + 2));
-    return;
-  }
-
-  if ((s[0] == 'c' || s[0] == 'C') && s[1] == ' ')
-  {
-    setCamAngle(atoi(s + 2));
-    return;
-  }
-
-  if ((s[0] == 'g' || s[0] == 'G') && s[1] == ' ')
-  {
-    setGripperAngle(atoi(s + 2));
-    return;
-  }
-}
-
-void setup()
-{
-  Serial.begin(115200);
-
-  servo_cam.write(CAM_HOME);
-  servo_base.write(BASE_HOME);
-  servo_sho.write(SHO_HOME);
-  servo_elb.write(ELB_HOME);
-  servo_grip.write(GRIP_HOME);
-
-  base_angle = BASE_HOME;
-  cam_angle = CAM_HOME;
-  sho_angle = SHO_HOME;
-  elb_angle = ELB_HOME;
-  grip_angle = GRIP_HOME;
-
-  servo_cam.attach(SERVO_CAM);
-  delay(80);
-  servo_base.attach(SERVO_BASE);
-  delay(80);
-  servo_sho.attach(SERVO_SHO);
-  delay(80);
-  servo_elb.attach(SERVO_ELB);
-  delay(80);
-  servo_grip.attach(SERVO_GRIP);
-  delay(80);
-
-  Wire.begin();
-  Wire.setClock(400000);
-
-  if (ENABLE_GRIP_TOF_INIT)
-  {
-    selectBus(TOF_GRIP_CH);
-    if (tof_grip.begin())
-      tof_grip.setMeasurementTimingBudgetMicroSeconds(20000);
-  }
-
-  selectBus(TOF_CAM_CH);
-  if (tof_cam.begin())
-    tof_cam.setMeasurementTimingBudgetMicroSeconds(20000);
-}
-
-void loop()
-{
-  while (Serial.available() > 0)
-  {
-    char c = Serial.read();
-    if (c == '\n' || c == '\r')
-    {
-      linebuf[linepos] = 0;
-      handleLine(linebuf);
-      linepos = 0;
-    }
-    else if (linepos < sizeof(linebuf) - 1)
-    {
-      linebuf[linepos++] = c;
-    }
-    else
-    {
-      linepos = 0;
-    }
-  }
-}
+import os
+import time
+import glob
+import platform
+import threading
+
+import cv2
+import serial
+import serial.tools.list_ports
+import torch
+from ultralytics import YOLO
+
+
+# ---------- Config ----------
+MODEL_PATH = "best_03_14.pt"
+TARGET_CLASS = "blue_cube"
+BAUD = 115200
+
+CAMERA_INDEX = 0
+CAMERA_WIDTH, CAMERA_HEIGHT = 640, 480
+INFER_IMGSZ = 512
+CONF_THRESH = 0.45
+
+# Servo limits / homes (must match the .ino)
+BASE_MIN, BASE_MAX, BASE_HOME = 0, 90, 45
+CAM_MIN,  CAM_MAX,  CAM_HOME  = 35, 120, 40
+
+# Tracking (P-only, fixed-rate)
+KP             = 0.004
+DEADZONE_PX    = 35
+MAX_STEP_DEG   = 2
+EMA_ALPHA      = 0.35
+CMD_GAP_SEC    = 0.10
+BASE_CMD_GAP_SEC = CMD_GAP_SEC / 1.3
+ALIGN_HOLD_SEC = 0.55
+
+PREPICK_TIMEOUT_SEC = 8.0
+GRAB_TIMEOUT_SEC    = 12.0
+
+
+# ---------- Camera thread ----------
+class CameraThread(threading.Thread):
+    def __init__(self, cap):
+        super().__init__(daemon=True)
+        self.cap = cap
+        self._latest = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+
+    def run(self):
+        while not self._stop.is_set():
+            ok, f = self.cap.read()
+            if ok:
+                with self._lock:
+                    self._latest = f
+            else:
+                time.sleep(0.002)
+
+    def read_latest(self):
+        with self._lock:
+            return None if self._latest is None else self._latest.copy()
+
+    def stop(self):
+        self._stop.set()
+
+
+# ---------- Helpers ----------
+def find_arduino_port():
+    for p in serial.tools.list_ports.comports():
+        d, n = (p.description or "").lower(), (p.device or "").lower()
+        if any(k in d for k in ("arduino", "ch340", "ch341", "wchusbserial", "usb-serial", "usb serial")) \
+           or any(k in n for k in ("ttyacm", "ttyusb", "ttych341")):
+            return p.device
+    for pat in ("/dev/ttyCH341USB*", "/dev/ttyCH341*"):
+        hits = sorted(glob.glob(pat))
+        if hits:
+            return hits[0]
+    return None
+
+
+def open_camera():
+    backend = (cv2.CAP_V4L2 if platform.system() == "Linux"
+               else cv2.CAP_DSHOW if platform.system() == "Windows" else 0)
+    cap = cv2.VideoCapture(CAMERA_INDEX, backend)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        return None
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def send_and_wait(ser, cmd, timeout_sec):
+    ser.reset_input_buffer()
+    ser.write((cmd + "\n").encode())
+    t0 = time.time()
+    while (time.time() - t0) < timeout_sec:
+        line = ser.readline().decode(errors="ignore").strip()
+        if line == "OK":
+            return True
+        if line == "ERR":
+            return False
+    return False
+
+
+# ---------- Main ----------
+def main():
+    if not os.path.exists(MODEL_PATH):
+        print(f"Model not found: {MODEL_PATH}")
+        return
+
+    model = YOLO(MODEL_PATH)
+    use_cuda = torch.cuda.is_available()
+    if TARGET_CLASS not in model.names.values():
+        print(f"Class '{TARGET_CLASS}' not in model")
+        return
+    target_id = next(k for k, v in model.names.items() if v == TARGET_CLASS)
+
+    cap = open_camera()
+    if cap is None:
+        print("Camera failed")
+        return
+    cam = CameraThread(cap)
+    cam.start()
+
+    port = find_arduino_port()
+    if port is None:
+        print("No Arduino")
+        cam.stop(); cap.release()
+        return
+    ser = serial.Serial(port, BAUD, timeout=0.05)
+    time.sleep(2.0)
+    ser.reset_input_buffer()
+
+    base, theta = BASE_HOME, CAM_HOME
+    ser.write(b"home\n")
+
+    sm_x = sm_y = None
+    centered_since = None
+    last_base_cmd_t = 0.0
+    last_cam_cmd_t = 0.0
+    pick_armed = False
+    waiting_for_grab_align = False
+
+    try:
+        while True:
+            frame = cam.read_latest()
+            if frame is None:
+                time.sleep(0.005)
+                continue
+
+            now = time.time()
+            h, w = frame.shape[:2]
+            cx0, cy0 = w // 2, h // 2
+
+            results = model.predict(
+                frame, imgsz=INFER_IMGSZ, conf=CONF_THRESH, classes=[target_id],
+                device=0 if use_cuda else "cpu", half=use_cuda, verbose=False,
+            )[0]
+
+            best = None
+            for box in results.boxes:
+                if int(box.cls[0]) != target_id:
+                    continue
+                conf = float(box.conf[0])
+                if best is None or conf > best["conf"]:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    best = {"conf": conf, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                            "cx": (x1 + x2) // 2, "cy": (y1 + y2) // 2}
+
+            cv2.line(frame, (cx0, 0), (cx0, h), (255, 0, 0), 1)
+            cv2.line(frame, (0, cy0), (w, cy0), (255, 0, 0), 1)
+
+            centered = False
+            if best is not None:
+                if sm_x is None:
+                    sm_x, sm_y = float(best["cx"]), float(best["cy"])
+                else:
+                    sm_x = (1 - EMA_ALPHA) * sm_x + EMA_ALPHA * best["cx"]
+                    sm_y = (1 - EMA_ALPHA) * sm_y + EMA_ALPHA * best["cy"]
+                cv2.rectangle(frame, (best["x1"], best["y1"]), (best["x2"], best["y2"]),
+                              (0, 255, 0), 2)
+                cv2.circle(frame, (best["cx"], best["cy"]), 5, (0, 255, 255), -1)
+                cv2.putText(frame, f"obj:({best['cx']},{best['cy']})",
+                            (best["cx"] + 8, best["cy"] - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+                cv2.circle(frame, (int(sm_x), int(sm_y)), 4, (255, 255, 0), -1)
+
+                err_b = int(sm_x) - cx0
+                err_c = cy0 - int(sm_y)
+                centered = abs(err_b) <= DEADZONE_PX and abs(err_c) <= DEADZONE_PX
+
+                if (now - last_base_cmd_t) >= BASE_CMD_GAP_SEC:
+                    if abs(err_b) > DEADZONE_PX:
+                        step_b = clamp(-err_b * KP, -MAX_STEP_DEG, MAX_STEP_DEG)
+                        if 0.0 < abs(step_b) < 1.0:
+                            step_b = -1.0 if step_b < 0 else 1.0
+                        nb = clamp(base + int(step_b), BASE_MIN, BASE_MAX)
+                        if nb != base:
+                            base = nb
+                            ser.write(f"b {base}\n".encode())
+
+                    last_base_cmd_t = now
+
+                if (now - last_cam_cmd_t) >= CMD_GAP_SEC:
+                    if abs(err_c) > DEADZONE_PX:
+                        step_c = clamp(err_c * KP, -MAX_STEP_DEG, MAX_STEP_DEG)
+                        if 0.0 < abs(step_c) < 1.0:
+                            step_c = -1.0 if step_c < 0 else 1.0
+                        nt = clamp(theta + int(step_c), CAM_MIN, CAM_MAX)
+                        if nt != theta:
+                            theta = nt
+                            ser.write(f"c {theta}\n".encode())
+                    last_cam_cmd_t = now
+            else:
+                sm_x = sm_y = None
+
+            centered_since = (centered_since or now) if centered else None
+            aligned = centered and centered_since and (now - centered_since) >= ALIGN_HOLD_SEC
+
+            status = "TRACK"
+            if waiting_for_grab_align:
+                status = "PREPICK_ALIGN" if not aligned else "PREPICK_ALIGNED"
+            elif pick_armed:
+                status = "PICK_ARMED"
+            elif aligned:
+                status = "ALIGNED"
+
+            cv2.putText(frame, status, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 255, 0) if aligned else (0, 200, 200), 2)
+            cv2.putText(frame, "p: pick  q: quit", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 2)
+            cv2.imshow("Auto Pick", frame)
+
+            if waiting_for_grab_align and aligned:
+                if send_and_wait(ser, "grab", GRAB_TIMEOUT_SEC):
+                    waiting_for_grab_align = False
+                    pick_armed = False
+                else:
+                    waiting_for_grab_align = False
+                    pick_armed = False
+                centered_since = None
+                t_now = time.time()
+                last_base_cmd_t = t_now
+                last_cam_cmd_t = t_now
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('p'):
+                pick_armed = True
+                if aligned:
+                    if send_and_wait(ser, "prepick", PREPICK_TIMEOUT_SEC):
+                        waiting_for_grab_align = True
+                    else:
+                        pick_armed = False
+                        waiting_for_grab_align = False
+                    centered_since = None
+                    t_now = time.time()
+                    last_base_cmd_t = t_now
+                    last_cam_cmd_t = t_now
+            if key == ord('q'):
+                break
+    finally:
+        cam.stop()
+        cap.release()
+        cv2.destroyAllWindows()
+        try:
+            ser.write(b"home\n")
+            time.sleep(0.5)
+            ser.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
